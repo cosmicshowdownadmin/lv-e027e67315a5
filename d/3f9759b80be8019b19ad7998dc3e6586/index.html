@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Live view</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+    background: #0b0d10; color: #e8eaed;
+  }
+  #gate {
+    min-height: 100%;
+    display: flex; align-items: center; justify-content: center;
+    padding: 24px;
+  }
+  .box {
+    width: 100%; max-width: 380px;
+    background: #12161c; border: 1px solid #1e2430; border-radius: 14px;
+    padding: 28px 24px;
+  }
+  h1 { font-size: 15px; letter-spacing: .12em; text-transform: uppercase; color: #9aa3af; font-weight: 600; margin: 0 0 16px; }
+  label { display: block; color: #8b93a0; font-size: 12px; letter-spacing: .08em; text-transform: uppercase; margin-bottom: 8px; }
+  input[type=password] {
+    width: 100%; padding: 12px 14px; border-radius: 10px;
+    border: 1px solid #2a3340; background: #0b0d10; color: #e8eaed;
+    font-size: 16px; outline: none;
+  }
+  input[type=password]:focus { border-color: #9ecbff; }
+  .row { display: flex; align-items: center; gap: 8px; margin: 14px 0 18px; color: #8b93a0; font-size: 13px; }
+  button {
+    width: 100%; padding: 12px 14px; border: 0; border-radius: 10px;
+    background: #2b6cb0; color: #fff; font-weight: 650; font-size: 14px; cursor: pointer;
+  }
+  button:hover { background: #3178c6; }
+  button:disabled { opacity: .6; cursor: default; }
+  .err { color: #ff6b6b; font-size: 13px; min-height: 18px; margin-top: 12px; }
+  .meta { color: #7b8494; font-size: 12px; margin-top: 16px; }
+  #viewwrap { display: none; height: 100%; flex-direction: column; }
+  #bar {
+    flex: 0 0 auto; padding: 6px 12px; font-size: 12px; color: #7b8494;
+    background: #0e1116; border-bottom: 1px solid #1e2430;
+    display: flex; justify-content: space-between; gap: 12px;
+  }
+  #view { flex: 1 1 auto; width: 100%; border: 0; background: #0b0d10; }
+</style>
+</head>
+<body>
+  <div id="gate">
+    <form class="box" id="form" autocomplete="on">
+      <h1>Live view</h1>
+      <label for="pw">Password</label>
+      <input id="pw" name="password" type="password" autocomplete="current-password" required>
+      <div class="row">
+        <input id="remember" type="checkbox">
+        <label for="remember" style="margin:0;text-transform:none;letter-spacing:0;font-size:13px;color:#8b93a0;font-weight:400;">Remember on this device</label>
+      </div>
+      <button type="submit" id="go">Unlock</button>
+      <div class="err" id="err"></div>
+      <div class="meta">This page is encrypted. Nothing is shown until the password decrypts it in your browser.</div>
+    </form>
+  </div>
+  <div id="viewwrap">
+    <div id="bar"><span id="status">Unlocking…</span><span><a href="#" id="lock" style="color:#9ecbff;text-decoration:none">Lock</a></span></div>
+    <iframe id="view" title="Dashboard" sandbox="allow-same-origin"></iframe>
+  </div>
+<script>
+(function () {
+  const ITER_FALLBACK = 210000;
+  const LS_KEY = "lv_k";
+  const SS_KEY = "lv_k";
+  const enc = new TextEncoder();
+  const dec = new TextDecoder();
+
+  const $ = (id) => document.getElementById(id);
+  const gate = $("gate");
+  const viewwrap = $("viewwrap");
+  const frame = $("view");
+  const status = $("status");
+  const err = $("err");
+
+  function b64ToBytes(s) {
+    const bin = atob(s);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  async function deriveKey(password, salt, iterations) {
+    const material = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveKey"]);
+    return crypto.subtle.deriveKey(
+      { name: "PBKDF2", salt, iterations, hash: "SHA-256" },
+      material,
+      { name: "AES-GCM", length: 256 },
+      false,
+      ["decrypt"]
+    );
+  }
+
+  async function decryptPayload(password, payload) {
+    const salt = b64ToBytes(payload.salt);
+    const iv = b64ToBytes(payload.iv);
+    const ct = b64ToBytes(payload.ct);
+    const iterations = payload.iter || ITER_FALLBACK;
+    const key = await deriveKey(password, salt, iterations);
+    const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ct);
+    return dec.decode(pt);
+  }
+
+  async function fetchPayload() {
+    const res = await fetch("payload.json?t=" + Date.now(), { cache: "no-store" });
+    if (!res.ok) throw new Error("Could not load the encrypted snapshot (" + res.status + ")");
+    return res.json();
+  }
+
+  function showError(msg) { err.textContent = msg || ""; }
+
+  function storePassword(password, remember) {
+    try { sessionStorage.setItem(SS_KEY, password); } catch (e) {}
+    try {
+      if (remember) localStorage.setItem(LS_KEY, password);
+      else localStorage.removeItem(LS_KEY);
+    } catch (e) {}
+  }
+
+  function clearStored() {
+    try { sessionStorage.removeItem(SS_KEY); } catch (e) {}
+    try { localStorage.removeItem(LS_KEY); } catch (e) {}
+  }
+
+  function savedPassword() {
+    try { return localStorage.getItem(LS_KEY) || sessionStorage.getItem(SS_KEY) || ""; }
+    catch (e) { return ""; }
+  }
+
+  function showDashboard(html, ts) {
+    gate.style.display = "none";
+    viewwrap.style.display = "flex";
+    frame.srcdoc = html;
+    status.textContent = ts ? ("Snapshot updated " + ts) : "Unlocked";
+  }
+
+  async function unlock(password, remember) {
+    showError("");
+    $("go").disabled = true;
+    try {
+      const payload = await fetchPayload();
+      const html = await decryptPayload(password, payload);
+      if (!html || html.indexOf("<html") === -1) throw new Error("bad");
+      storePassword(password, remember);
+      showDashboard(html, payload.ts || "");
+      startRefresh(password);
+    } catch (e) {
+      clearStored();
+      showError("Wrong password or the snapshot could not be decrypted.");
+      $("go").disabled = false;
+      throw e;
+    }
+    $("go").disabled = false;
+  }
+
+  let timer = null;
+  function startRefresh(password) {
+    if (timer) clearInterval(timer);
+    timer = setInterval(async () => {
+      try {
+        const payload = await fetchPayload();
+        const html = await decryptPayload(password, payload);
+        frame.srcdoc = html;
+        status.textContent = payload.ts ? ("Snapshot updated " + tsLocal(payload.ts)) : "Unlocked";
+        if (payload.ts) status.textContent = "Snapshot updated " + payload.ts;
+      } catch (e) {
+        status.textContent = "Could not refresh snapshot; showing last good copy.";
+      }
+    }, 30000);
+  }
+
+  function tsLocal(s) { return s; }
+
+  $("form").addEventListener("submit", function (ev) {
+    ev.preventDefault();
+    const password = $("pw").value;
+    const remember = $("remember").checked;
+    if (!password) return;
+    unlock(password, remember).catch(function () {});
+  });
+
+  $("lock").addEventListener("click", function (ev) {
+    ev.preventDefault();
+    if (timer) clearInterval(timer);
+    clearStored();
+    frame.srcdoc = "";
+    viewwrap.style.display = "none";
+    gate.style.display = "flex";
+    $("pw").value = "";
+    showError("");
+  });
+
+  const existing = savedPassword();
+  if (existing) {
+    $("pw").value = existing;
+    $("remember").checked = !!localStorage.getItem(LS_KEY);
+    unlock(existing, !!localStorage.getItem(LS_KEY)).catch(function () {
+      $("pw").value = "";
+    });
+  }
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,4 @@
+.dashboard_password
+.dashboard_salt
+.token
+*.tmp
