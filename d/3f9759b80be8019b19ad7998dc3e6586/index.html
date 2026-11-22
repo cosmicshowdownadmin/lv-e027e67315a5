@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex,nofollow">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <title>Live view</title>
 <style>
   :root { color-scheme: dark; }
@@ -33,20 +34,29 @@
   input[type=password]:focus { border-color: #9ecbff; }
   .row { display: flex; align-items: center; gap: 8px; margin: 14px 0 18px; color: #8b93a0; font-size: 13px; }
   button {
-    width: 100%; padding: 12px 14px; border: 0; border-radius: 10px;
+    padding: 12px 14px; border: 0; border-radius: 10px;
     background: #2b6cb0; color: #fff; font-weight: 650; font-size: 14px; cursor: pointer;
   }
   button:hover { background: #3178c6; }
   button:disabled { opacity: .6; cursor: default; }
+  button.secondary { background: #1a2330; color: #9ecbff; }
+  button.secondary:hover { background: #243044; }
+  #go { width: 100%; }
   .err { color: #ff6b6b; font-size: 13px; min-height: 18px; margin-top: 12px; }
   .meta { color: #7b8494; font-size: 12px; margin-top: 16px; }
   #viewwrap { display: none; height: 100%; flex-direction: column; }
   #bar {
-    flex: 0 0 auto; padding: 6px 12px; font-size: 12px; color: #7b8494;
+    flex: 0 0 auto; padding: 8px 12px; font-size: 13px; color: #e8eaed;
     background: #0e1116; border-bottom: 1px solid #1e2430;
-    display: flex; justify-content: space-between; gap: 12px;
+    display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap;
   }
+  #asof { font-weight: 650; font-variant-numeric: tabular-nums; }
+  #asof .label { color: #8b93a0; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; font-size: 11px; margin-right: 8px; }
+  #bar-actions { display: flex; gap: 8px; align-items: center; }
+  #refreshBtn { padding: 8px 16px; font-size: 13px; }
+  #lock { background: transparent; color: #9ecbff; padding: 8px 10px; }
   #view { flex: 1 1 auto; width: 100%; border: 0; background: #0b0d10; }
+  #bar-msg { color: #8b93a0; font-size: 12px; }
 </style>
 </head>
 <body>
@@ -65,7 +75,14 @@
     </form>
   </div>
   <div id="viewwrap">
-    <div id="bar"><span id="status">Unlocking…</span><span><a href="#" id="lock" style="color:#9ecbff;text-decoration:none">Lock</a></span></div>
+    <div id="bar">
+      <div id="asof"><span class="label">As of</span><span id="asofTime">—</span></div>
+      <div id="bar-msg"></div>
+      <div id="bar-actions">
+        <button type="button" id="refreshBtn">Refresh</button>
+        <button type="button" id="lock" class="secondary">Lock</button>
+      </div>
+    </div>
     <iframe id="view" title="Dashboard" sandbox="allow-same-origin"></iframe>
   </div>
 <script>
@@ -73,6 +90,7 @@
   const ITER_FALLBACK = 210000;
   const LS_KEY = "lv_k";
   const SS_KEY = "lv_k";
+  const REPO = "cosmicshowdownadmin/lv-e027e67315a5";
   const enc = new TextEncoder();
   const dec = new TextDecoder();
 
@@ -80,8 +98,18 @@
   const gate = $("gate");
   const viewwrap = $("viewwrap");
   const frame = $("view");
-  const status = $("status");
   const err = $("err");
+  const asofTime = $("asofTime");
+  const barMsg = $("bar-msg");
+  const refreshBtn = $("refreshBtn");
+
+  function tokenFromPath() {
+    const parts = location.pathname.split("/").filter(Boolean);
+    const i = parts.lastIndexOf("d");
+    return (i >= 0 && parts[i + 1]) ? parts[i + 1] : "";
+  }
+  const TOKEN = tokenFromPath();
+  const RAW_BASE = "https://raw.githubusercontent.com/" + REPO + "/main/d/" + TOKEN + "/";
 
   function b64ToBytes(s) {
     const bin = atob(s);
@@ -111,10 +139,92 @@
     return dec.decode(pt);
   }
 
-  async function fetchPayload() {
-    const res = await fetch("payload.json?t=" + Date.now(), { cache: "no-store" });
-    if (!res.ok) throw new Error("Could not load the encrypted snapshot (" + res.status + ")");
+  function ptMinuteKeys(back) {
+    const keys = [];
+    const now = Date.now();
+    for (let i = 0; i <= back; i++) {
+      const d = new Date(now - i * 60 * 1000);
+      const parts = new Intl.DateTimeFormat("en-US", {
+        timeZone: "America/Los_Angeles",
+        year: "numeric", month: "2-digit", day: "2-digit",
+        hour: "2-digit", minute: "2-digit",
+        hourCycle: "h23"
+      }).formatToParts(d);
+      const get = (t) => parts.find((p) => p.type === t).value;
+      keys.push(get("year") + get("month") + get("day") + get("hour") + get("minute"));
+    }
+    return keys;
+  }
+
+  function cacheBust(url) {
+    return url + (url.indexOf("?") >= 0 ? "&" : "?") + "t=" + Date.now();
+  }
+
+  // Simple GET only (no custom headers) so cross-origin raw.githubusercontent.com
+  // requests stay "simple" and skip a CORS preflight that would 403.
+  async function fetchJson(url) {
+    const res = await fetch(cacheBust(url));
+    if (!res.ok) throw new Error("http " + res.status);
     return res.json();
+  }
+
+  function isPayload(obj) {
+    return obj && obj.ct && obj.iv && obj.salt;
+  }
+
+  function ptrFileUrl(ptr, base) {
+    if (!ptr || !ptr.file) return null;
+    if (!/^p\/[0-9]{14}\.json$/.test(ptr.file)) return null;
+    return base + ptr.file;
+  }
+
+  async function firstOk(urls, pred) {
+    for (const url of urls) {
+      try {
+        const data = await fetchJson(url);
+        if (!pred || pred(data)) return { data, url };
+      } catch (e) {}
+    }
+    return null;
+  }
+
+  async function fetchPayload() {
+    const mins = ptMinuteKeys(8);
+    const rawPtrs = mins.map((m) => RAW_BASE + "ptr/" + m + ".json");
+    const pagePtrs = mins.map((m) => "ptr/" + m + ".json");
+    const rawPtr = await firstOk(rawPtrs, (d) => d && d.file);
+    if (rawPtr) {
+      const u = ptrFileUrl(rawPtr.data, RAW_BASE);
+      if (u) {
+        const p = await firstOk([u, RAW_BASE + "payload.json"], isPayload);
+        if (p) return p.data;
+      }
+    }
+    const pagePtr = await firstOk(pagePtrs, (d) => d && d.file);
+    if (pagePtr) {
+      const u = ptrFileUrl(pagePtr.data, "");
+      if (u) {
+        const p = await firstOk([u, "payload.json"], isPayload);
+        if (p) return p.data;
+      }
+    }
+    const fallback = await firstOk([RAW_BASE + "payload.json", "payload.json"], isPayload);
+    if (fallback) return fallback.data;
+
+    // Manual/last-resort: GitHub Contents API is not CDN-cached for 10 minutes.
+    try {
+      const api = "https://api.github.com/repos/" + REPO + "/contents/d/" + TOKEN + "/payload.json?ref=main&t=" + Date.now();
+      const res = await fetch(api, { headers: { Accept: "application/vnd.github+json" } });
+      if (res.ok) {
+        const body = await res.json();
+        if (body && body.content) {
+          const text = dec.decode(b64ToBytes(body.content.replace(/\n/g, "")));
+          const data = JSON.parse(text);
+          if (isPayload(data)) return data;
+        }
+      }
+    } catch (e) {}
+    throw new Error("Could not load the encrypted snapshot");
   }
 
   function showError(msg) { err.textContent = msg || ""; }
@@ -137,25 +247,40 @@
     catch (e) { return ""; }
   }
 
-  function showDashboard(html, ts) {
+  function setAsOf(ts, msg) {
+    asofTime.textContent = ts ? ts : "—";
+    barMsg.textContent = msg || "";
+  }
+
+  function showDashboard(html, ts, msg) {
     gate.style.display = "none";
     viewwrap.style.display = "flex";
     frame.srcdoc = html;
-    status.textContent = ts ? ("Snapshot updated " + ts) : "Unlocked";
+    setAsOf(ts, msg || "");
+  }
+
+  let currentPassword = "";
+  let refreshing = false;
+
+  async function applyPayload(password, msg) {
+    const payload = await fetchPayload();
+    const html = await decryptPayload(password, payload);
+    if (!html || html.indexOf("<html") === -1) throw new Error("bad");
+    showDashboard(html, payload.ts || "", msg || "");
+    return payload.ts || "";
   }
 
   async function unlock(password, remember) {
     showError("");
     $("go").disabled = true;
     try {
-      const payload = await fetchPayload();
-      const html = await decryptPayload(password, payload);
-      if (!html || html.indexOf("<html") === -1) throw new Error("bad");
+      await applyPayload(password, "");
+      currentPassword = password;
       storePassword(password, remember);
-      showDashboard(html, payload.ts || "");
-      startRefresh(password);
+      startRefresh();
     } catch (e) {
       clearStored();
+      currentPassword = "";
       showError("Wrong password or the snapshot could not be decrypted.");
       $("go").disabled = false;
       throw e;
@@ -163,23 +288,29 @@
     $("go").disabled = false;
   }
 
-  let timer = null;
-  function startRefresh(password) {
-    if (timer) clearInterval(timer);
-    timer = setInterval(async () => {
-      try {
-        const payload = await fetchPayload();
-        const html = await decryptPayload(password, payload);
-        frame.srcdoc = html;
-        status.textContent = payload.ts ? ("Snapshot updated " + tsLocal(payload.ts)) : "Unlocked";
-        if (payload.ts) status.textContent = "Snapshot updated " + payload.ts;
-      } catch (e) {
-        status.textContent = "Could not refresh snapshot; showing last good copy.";
+  async function refreshNow(reason) {
+    if (!currentPassword || refreshing) return;
+    refreshing = true;
+    refreshBtn.disabled = true;
+    barMsg.textContent = "Refreshing…";
+    try {
+      const ts = await applyPayload(currentPassword, reason === "auto" ? "" : "Updated");
+      if (reason !== "auto") {
+        barMsg.textContent = ts ? "Updated" : "Updated";
+        setTimeout(function () { if (barMsg.textContent === "Updated") barMsg.textContent = ""; }, 2000);
       }
-    }, 30000);
+    } catch (e) {
+      barMsg.textContent = "Could not refresh; showing last good copy.";
+    }
+    refreshBtn.disabled = false;
+    refreshing = false;
   }
 
-  function tsLocal(s) { return s; }
+  let timer = null;
+  function startRefresh() {
+    if (timer) clearInterval(timer);
+    timer = setInterval(function () { refreshNow("auto"); }, 60000);
+  }
 
   $("form").addEventListener("submit", function (ev) {
     ev.preventDefault();
@@ -189,14 +320,22 @@
     unlock(password, remember).catch(function () {});
   });
 
+  refreshBtn.addEventListener("click", function () { refreshNow("button"); });
+
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState === "visible" && currentPassword) refreshNow("auto");
+  });
+
   $("lock").addEventListener("click", function (ev) {
     ev.preventDefault();
     if (timer) clearInterval(timer);
     clearStored();
+    currentPassword = "";
     frame.srcdoc = "";
     viewwrap.style.display = "none";
     gate.style.display = "flex";
     $("pw").value = "";
+    setAsOf("", "");
     showError("");
   });
 
